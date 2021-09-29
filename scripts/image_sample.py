@@ -19,6 +19,7 @@ from guided_diffusion.script_util import (
     args_to_dict,
 )
 
+from PIL import Image
 
 def main():
     args = create_argparser().parse_args()
@@ -85,6 +86,11 @@ def main():
             np.savez(out_path, arr, label_arr)
         else:
             np.savez(out_path, arr)
+
+        for i, image in enumerate(arr):
+            im = Image.fromarray(image)
+            image_path = os.path.join(logger.get_dir(), f"sample_{i}.png")
+            im.save(image_path)
 
     dist.barrier()
     logger.log("sampling complete")
