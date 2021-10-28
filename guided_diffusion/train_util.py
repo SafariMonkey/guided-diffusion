@@ -19,6 +19,16 @@ from .resample import LossAwareSampler, UniformSampler
 INITIAL_LOG_LOSS_SCALE = 20.0
 
 
+def shrink_perturb(model, lamda=0.5, sigma=0.01):
+    for (name, param) in model.named_parameters():
+        if 'weight' in name:       # just weights
+            shape = param.data.shape
+            param.data = \
+                (lamda * param.data) + \
+                th.normal(0.0, sigma, size=shape).to(param.device)
+    return
+
+
 class TrainLoop:
     def __init__(
         self,
@@ -33,6 +43,10 @@ class TrainLoop:
         log_interval,
         save_interval,
         resume_checkpoint,
+        resume_weights_only=False,
+        load_strict=True,
+        freeze_loaded_layers=False,
+        shrink_and_perturb=False,
         use_fp16=False,
         fp16_scale_growth=1e-3,
         schedule_sampler=None,
@@ -53,6 +67,10 @@ class TrainLoop:
         self.log_interval = log_interval
         self.save_interval = save_interval
         self.resume_checkpoint = resume_checkpoint
+        self.resume_weights_only = resume_weights_only
+        self.load_strict = load_strict
+        self.shrink_and_perturb = shrink_and_perturb
+        self.freeze_loaded_layers = freeze_loaded_layers
         self.use_fp16 = use_fp16
         self.fp16_scale_growth = fp16_scale_growth
         self.schedule_sampler = schedule_sampler or UniformSampler(diffusion)
@@ -75,7 +93,7 @@ class TrainLoop:
         self.opt = AdamW(
             self.mp_trainer.master_params, lr=self.lr, weight_decay=self.weight_decay
         )
-        if self.resume_step:
+        if self.resume_step and not self.resume_weights_only:
             self._load_optimizer_state()
             # Model was resumed, either due to a restart or a checkpoint
             # being specified at the command line.
@@ -114,11 +132,20 @@ class TrainLoop:
             self.resume_step = parse_resume_step_from_filename(resume_checkpoint)
             if dist.get_rank() == 0:
                 logger.log(f"loading model from checkpoint: {resume_checkpoint}...")
-                self.model.load_state_dict(
+                missing_keys, unexpected_keys = self.model.load_state_dict(
                     dist_util.load_state_dict(
                         resume_checkpoint, map_location=dist_util.dev()
-                    )
+                    ),
+                    strict=self.load_strict,
                 )
+                if self.freeze_loaded_layers:
+                    for name, param in self.model.named_parameters():
+                        if name not in missing_keys:
+                            print(f"freezing param {name}")
+                            param.requires_grad_(False)
+
+                if self.shrink_and_perturb:
+                    shrink_perturb(self.model, lamda=0.6, sigma=0.01)
 
         dist_util.sync_params(self.model.parameters())
 

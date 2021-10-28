@@ -1,4 +1,5 @@
 from abc import abstractmethod
+from collections import OrderedDict
 
 import math
 
@@ -17,6 +18,12 @@ from .nn import (
     normalization,
     timestep_embedding,
 )
+
+
+class MyModuleDict(nn.ModuleDict):
+    def __setitem__(self, key, value):
+        print(f"Setting {key}")
+        super(MyModuleDict, self).__setitem__(key, value)
 
 
 class AttentionPool2d(nn.Module):
@@ -478,14 +485,17 @@ class UNetModel(nn.Module):
             self.label_emb = nn.Embedding(num_classes, time_embed_dim)
 
         ch = input_ch = int(channel_mult[0] * model_channels)
-        self.input_blocks = nn.ModuleList(
-            [TimestepEmbedSequential(conv_nd(dims, in_channels, ch, 3, padding=1))]
+        self.input_blocks = MyModuleDict(
+            OrderedDict([(f'in_conv_{self.image_size}', TimestepEmbedSequential(conv_nd(dims, in_channels, ch, 3, padding=1)))])
         )
         self._feature_size = ch
         input_block_chans = [ch]
         ds = 1
+
+        num_levels = len(channel_mult)
         for level, mult in enumerate(channel_mult):
-            for _ in range(num_res_blocks):
+            layer_size = self.image_size // ds
+            for i in range(num_res_blocks):
                 layers = [
                     ResBlock(
                         ch,
@@ -508,27 +518,26 @@ class UNetModel(nn.Module):
                             use_new_attention_order=use_new_attention_order,
                         )
                     )
-                self.input_blocks.append(TimestepEmbedSequential(*layers))
+                suffix = "_inlayer" if layer_size == self.image_size else ""
+                self.input_blocks[f'{layer_size}_blocks_{i}{suffix}'] = TimestepEmbedSequential(*layers)
                 self._feature_size += ch
                 input_block_chans.append(ch)
             if level != len(channel_mult) - 1:
                 out_ch = ch
-                self.input_blocks.append(
-                    TimestepEmbedSequential(
-                        ResBlock(
-                            ch,
-                            time_embed_dim,
-                            dropout,
-                            out_channels=out_ch,
-                            dims=dims,
-                            use_checkpoint=use_checkpoint,
-                            use_scale_shift_norm=use_scale_shift_norm,
-                            down=True,
-                        )
-                        if resblock_updown
-                        else Downsample(
-                            ch, conv_resample, dims=dims, out_channels=out_ch
-                        )
+                self.input_blocks[f'{layer_size}_updown'] = TimestepEmbedSequential(
+                    ResBlock(
+                        ch,
+                        time_embed_dim,
+                        dropout,
+                        out_channels=out_ch,
+                        dims=dims,
+                        use_checkpoint=use_checkpoint,
+                        use_scale_shift_norm=use_scale_shift_norm,
+                        down=True,
+                    )
+                    if resblock_updown
+                    else Downsample(
+                        ch, conv_resample, dims=dims, out_channels=out_ch
                     )
                 )
                 ch = out_ch
@@ -563,9 +572,10 @@ class UNetModel(nn.Module):
         )
         self._feature_size += ch
 
-        self.output_blocks = nn.ModuleList([])
+        self.output_blocks = MyModuleDict()
         for level, mult in list(enumerate(channel_mult))[::-1]:
             for i in range(num_res_blocks + 1):
+                layer_size = self.image_size // ds
                 ich = input_block_chans.pop()
                 layers = [
                     ResBlock(
@@ -606,14 +616,16 @@ class UNetModel(nn.Module):
                         else Upsample(ch, conv_resample, dims=dims, out_channels=out_ch)
                     )
                     ds //= 2
-                self.output_blocks.append(TimestepEmbedSequential(*layers))
+                suffix = "_outlayer" if layer_size == self.image_size else ""
+                self.output_blocks[f'{layer_size}_blocks_{i}{suffix}'] = TimestepEmbedSequential(*layers)
                 self._feature_size += ch
 
-        self.out = nn.Sequential(
+        self.out_module = f'out_{image_size}'
+        self.add_module(self.out_module, nn.Sequential(
             normalization(ch),
             nn.SiLU(),
             zero_module(conv_nd(dims, input_ch, out_channels, 3, padding=1)),
-        )
+        ))
 
     def convert_to_fp16(self):
         """
@@ -652,15 +664,15 @@ class UNetModel(nn.Module):
             emb = emb + self.label_emb(y)
 
         h = x.type(self.dtype)
-        for module in self.input_blocks:
+        for module in self.input_blocks.values():
             h = module(h, emb)
             hs.append(h)
         h = self.middle_block(h, emb)
-        for module in self.output_blocks:
+        for module in self.output_blocks.values():
             h = th.cat([h, hs.pop()], dim=1)
             h = module(h, emb)
         h = h.type(x.dtype)
-        return self.out(h)
+        return self.get_submodule(self.out_module)(h)
 
 
 class SuperResModel(UNetModel):
@@ -736,8 +748,8 @@ class EncoderUNetModel(nn.Module):
         )
 
         ch = int(channel_mult[0] * model_channels)
-        self.input_blocks = nn.ModuleList(
-            [TimestepEmbedSequential(conv_nd(dims, in_channels, ch, 3, padding=1))]
+        self.input_blocks = MyModuleDict(
+            OrderedDict([(f'in_conv_{self.image_size}', TimestepEmbedSequential(conv_nd(dims, in_channels, ch, 3, padding=1)))]),
         )
         self._feature_size = ch
         input_block_chans = [ch]
@@ -766,27 +778,25 @@ class EncoderUNetModel(nn.Module):
                             use_new_attention_order=use_new_attention_order,
                         )
                     )
-                self.input_blocks.append(TimestepEmbedSequential(*layers))
+                self.input_blocks[f'{inv_level}'] = TimestepEmbedSequential(*layers)
                 self._feature_size += ch
                 input_block_chans.append(ch)
             if level != len(channel_mult) - 1:
                 out_ch = ch
-                self.input_blocks.append(
-                    TimestepEmbedSequential(
-                        ResBlock(
-                            ch,
-                            time_embed_dim,
-                            dropout,
-                            out_channels=out_ch,
-                            dims=dims,
-                            use_checkpoint=use_checkpoint,
-                            use_scale_shift_norm=use_scale_shift_norm,
-                            down=True,
-                        )
-                        if resblock_updown
-                        else Downsample(
-                            ch, conv_resample, dims=dims, out_channels=out_ch
-                        )
+                self.input_blocks[f'{inv_level}'] = TimestepEmbedSequential(
+                    ResBlock(
+                        ch,
+                        time_embed_dim,
+                        dropout,
+                        out_channels=out_ch,
+                        dims=dims,
+                        use_checkpoint=use_checkpoint,
+                        use_scale_shift_norm=use_scale_shift_norm,
+                        down=True,
+                    )
+                    if resblock_updown
+                    else Downsample(
+                        ch, conv_resample, dims=dims, out_channels=out_ch
                     )
                 )
                 ch = out_ch
@@ -822,35 +832,39 @@ class EncoderUNetModel(nn.Module):
         self._feature_size += ch
         self.pool = pool
         if pool == "adaptive":
-            self.out = nn.Sequential(
+            self.out_module = f'out_{image_size}'
+            self.add_module(self.out_module, nn.Sequential(
                 normalization(ch),
                 nn.SiLU(),
                 nn.AdaptiveAvgPool2d((1, 1)),
                 zero_module(conv_nd(dims, ch, out_channels, 1)),
                 nn.Flatten(),
-            )
+            ))
         elif pool == "attention":
             assert num_head_channels != -1
-            self.out = nn.Sequential(
+            self.out_module = f'out_{image_size}'
+            self.add_module(self.out_module, nn.Sequential(
                 normalization(ch),
                 nn.SiLU(),
                 AttentionPool2d(
                     (image_size // ds), ch, num_head_channels, out_channels
                 ),
-            )
+            ))
         elif pool == "spatial":
-            self.out = nn.Sequential(
+            self.out_module = f'out_{image_size}'
+            self.add_module(self.out_module, nn.Sequential(
                 nn.Linear(self._feature_size, 2048),
                 nn.ReLU(),
                 nn.Linear(2048, self.out_channels),
-            )
+            ))
         elif pool == "spatial_v2":
-            self.out = nn.Sequential(
+            self.out_module = f'out_{image_size}'
+            self.add_module(self.out_module, nn.Sequential(
                 nn.Linear(self._feature_size, 2048),
                 normalization(2048),
                 nn.SiLU(),
                 nn.Linear(2048, self.out_channels),
-            )
+            ))
         else:
             raise NotImplementedError(f"Unexpected {pool} pooling")
 
@@ -880,7 +894,7 @@ class EncoderUNetModel(nn.Module):
 
         results = []
         h = x.type(self.dtype)
-        for module in self.input_blocks:
+        for module in self.input_blocks.values():
             h = module(h, emb)
             if self.pool.startswith("spatial"):
                 results.append(h.type(x.dtype).mean(dim=(2, 3)))
@@ -888,7 +902,7 @@ class EncoderUNetModel(nn.Module):
         if self.pool.startswith("spatial"):
             results.append(h.type(x.dtype).mean(dim=(2, 3)))
             h = th.cat(results, axis=-1)
-            return self.out(h)
+            return self.get_submodule(self.out_module)(h)
         else:
             h = h.type(x.dtype)
-            return self.out(h)
+            return self.get_submodule(self.out_module)(h)
